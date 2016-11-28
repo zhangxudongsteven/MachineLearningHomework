@@ -8,25 +8,218 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+library(dplyr)
+library(ggplot2)
+library(caret)
 ```
 
-## R Markdown
+## 1 - Synopsis
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+This analysis aims to predict the activity from device data. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. The training data can be download [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv), which has been downloaded to local disk for convience.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## 2 - Data Preprocessing
 
-```{r cars}
-summary(cars)
+First, let's load the data and check the dimensions and missing value. 
+
+```{r preprocessing1}
+df.training <- read.csv("data/pml-training.csv")
+df.final <- read.csv("data/pml-testing.csv")
+dim(df.training)
+dim(df.final)
+summary(as.factor(apply(df.final, 2, function(x) sum(is.na(x)))))
 ```
 
-## Including Plots
+From the analysis above, we can see the testing dataset have 100 complete NA columns, and 60 columns without missing value. In this case, I will remove these column from both dataset. Then, according to the demand in real situations, we should not judge activity type from some variables such as user name and time, even it might be quiet useful. So I will remove the first 7 columns.
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r preprocessing2}
+temp <- data.frame(id = 1:160, missing = apply(df.final, 2, function(x) sum(is.na(x))))
+temp <- filter(temp, missing == 0)
+df.training <- select(df.training, temp$id)
+df.final <- select(df.final, temp$id)
+df.training <- select(df.training, 8:60)
+df.final <- select(df.final, 8:60)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Then, Let's check the variability and remove the zero-variance covariates.
+
+```{r preprocessing3}
+nsv <- nearZeroVar(df.training, saveMetrics = TRUE)
+zeroVarSum <- sum(nsv$zeroVar)
+nzvSum <- sum(nsv$nzv)
+```
+
+There are **`r zeroVarSum`** zero variance and **`r nzvSum`** near-zero-variance. Seems good. 
+
+Next, we need to analysis the multi-collinearity.
+
+```{r preprocessing4}
+cor.train <- cor(df.training[,-53])
+kappa.train <- kappa(cor.train, exact = TRUE)
+```
+
+The Kappa of original train set is **`r kappa.train`**, which is too high (>1000). we need to perform PCA. During the PCA process, I will keep **90 cumulative percent** of variance.
+
+```{r preprocessing5}
+preProc <- preProcess(df.training[,-53], method = c("center", "scale", "pca"), thresh = 0.9)
+source.data <- predict(preProc, df.training[,-53])
+final <- predict(preProc, df.final[,-53])
+source.data$classe <- df.training$classe
+final$problem_id <- df.final$problem_id
+```
+
+Then, the data can be used in the next step. To be attenion, the last column of training set is the class type, but it's the id for final testing set's. Finally, I will split the data into training and testing.
+
+```{r preprocessing6}
+inTrain <- createDataPartition(y=source.data$classe, p = 0.7, list = FALSE)
+training <- source.data[inTrain,]
+testing <- source.data[-inTrain,]
+# detach it to avoid masked
+detach("package:dplyr", unload=TRUE)
+```
+
+## 3 - Exploratory Analysis
+
+Because we have done a PCA transformation, so the comprehensibility will be influenced. 
+
+## 4 - Classification
+
+In this part, we will use three algorithms to perform the prediction, and use random forest to combine them. It will take a lot of time to train the model, so I have trained them and saved locally. You can use code in the annotation to redo the training.
+
+### 4.1 - SVM
+
+First, I will train a svm model and check it's efficiency. 
+
+```{r classification1}
+library(e1071)
+svm.fit <- svm(classe ~ ., data = training)
+pred <- predict(svm.fit, newdata = testing)
+confusionMatrix(testing$classe, pred)
+```
+
+The overall accuracy is **over 90%**, which is very ideal.
+
+### 4.2 - Random Forest
+
+Then, I will try random forest and check it's efficiency. 
+
+```{r classification2}
+library(randomForest)
+rf.fit <- randomForest(classe ~ ., data = training)
+pred <- predict(rf.fit, testing, type = "response")
+confusionMatrix(testing$classe, pred)
+```
+
+The overall accuracy is **over 95%**, which is very ideal.
+
+### 4.3 - Neural Networks
+
+Then, I will try Neural Networks and check it's efficiency.
+
+```{r classification3}
+library(nnet)
+nnet.fit <- nnet(classe ~ ., data = training, size = 5)
+pred <- predict(nnet.fit, testing, type = "class")
+confusionMatrix(testing$classe, pred)
+# library(neuralnet)
+# nn.name <- names(training)
+# nn.f <- as.formula(paste("classe ~", paste(nn.name[!nn.name %in% "classe"], collapse = " + ")))
+# temp <- training
+# temp$classe <- as.integer(temp$classe)
+# nn.fit <- neuralnet(f, data = temp, linear.output = TRUE)
+# rm(temp)
+```
+
+The accuracy is around 50 percent, which is quiet low.
+
+### 4.4 - Xgboost
+
+Then, I will try Neural Networks and check it's efficiency.
+
+```{r classification4}
+library(xgboost)
+xg.train <- as.matrix(training[,-20])
+mode(xg.train) = "numeric"
+xg.test <- as.matrix(testing[,-20])
+mode(xg.test) = "numeric"
+xg.train.target = as.matrix(as.integer(training[,20]) - 1)
+xg.test.target = as.matrix(as.integer(testing[,20]) - 1)
+
+# set the xgboost parameters
+param <- list("objective" = "multi:softprob",    # multiclass classification 
+              "num_class" = 5,    # number of classes 
+              "eval_metric" = "merror",    # evaluation metric 
+              "nthread" = 2,   # number of threads to be used 
+              "max_depth" = 16,    # maximum depth of tree 
+              "eta" = 0.3,    # step size shrinkage 
+              "gamma" = 0,    # minimum loss reduction 
+              "subsample" = 1,    # part of data instances to grow tree 
+              "colsample_bytree" = 1,  # subsample ratio of columns when constructing each tree 
+              "min_child_weight" = 12  # minimum sum of instance weight needed in a child 
+              )
+
+# start the iteration and record the performance of each model
+system.time(bst.cv <- xgb.cv(param = param, data = xg.train, label = xg.train.target, nfold = 4, nrounds = 200, prediction = TRUE, verbose = FALSE))
+min.merror.idx = which.min(bst.cv$dt[, test.merror.mean])
+bst.cv$dt[min.merror.idx,]
+```
+
+The best cross-validation¡¯s minimum error rate occured at 106th iteration. Its info is listed above.
+
+```{r classification5}
+system.time(xg.fit <- xgboost(param = param, data = xg.train, label = xg.train.target, nrounds = min.merror.idx, verbose = 0))
+pred <- predict(xg.fit, xg.test)
+pred = matrix(pred, nrow = 5, ncol = length(pred) / 5)
+pred = t(pred)
+pred = max.col(pred, "last")
+confusionMatrix(factor(xg.test.target + 1), factor(pred))
+```
+
+The overall accuracy is **over 95%**, which is very ideal.
+
+### 4.5 - Result Combination
+
+Finally, It's time to combine these model together. 
+
+```{r classification6}
+svm.pred <- predict(svm.fit, newdata = testing)
+rf.pred <- predict(rf.fit, testing, type = "response")
+xg.pred <- predict(xg.fit, xg.test)
+xg.pred = matrix(xg.pred, nrow = 5, ncol = length(xg.pred) / 5)
+xg.pred = t(xg.pred)
+xg.pred = max.col(xg.pred, "last")
+xg.pred = toupper(letters[xg.pred])
+predDF <- data.frame(svm.pred, rf.pred, xg.pred, classe = testing$classe)
+# build model
+combModFit <- randomForest(classe ~ ., data = predDF)
+predComb <- predict(combModFit, predDF)
+confusionMatrix(testing$classe, predComb)
+```
+
+We can see that the accuracy is around **98%**, which should be called perfect. 
+
+### 4.6 - Calculate For Submit
+
+In usual, we need to retrain all the model with total dataset for a better result, but I skip these steps for convenience. I will calculate and submit the result directly.
+
+```{r submit}
+svm.pred <- predict(svm.fit, newdata = final)
+rf.pred <- predict(rf.fit, final, type = "response")
+xg.pred <- predict(xg.fit, as.matrix(final))
+xg.pred = matrix(xg.pred, nrow = 5, ncol = length(xg.pred) / 5)
+xg.pred = t(xg.pred)
+xg.pred = max.col(xg.pred, "last")
+xg.pred = toupper(letters[xg.pred])
+predDF <- data.frame(svm.pred, rf.pred, xg.pred)
+predComb <- predict(combModFit, predDF)
+result <- data.frame(id = final$problem_id, pred = predComb)
+# t(result)
+```
+
+## 5 - Summary
+
+## 5.1 - Hardware & Software Env
+
+```{r env, echo=FALSE}
+sessionInfo()
+```
